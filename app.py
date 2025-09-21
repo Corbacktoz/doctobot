@@ -1,39 +1,41 @@
-import os, asyncio, re, json
+import os, asyncio, re, argparse
 from datetime import datetime, timedelta
 import pytz
 import requests
 from dateutil import parser as dp
 from playwright.async_api import async_playwright
 
+# --------- Config ----------
 DOCTOLIB_URL = "https://www.doctolib.fr/dermatologue/toulouse?availabilities=1"
 TZ = pytz.timezone("Europe/Paris")
-WINDOW_DAYS = 14
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
+# Env var pour la fenêtre par défaut (jours)
+DEFAULT_WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "14"))
 
 DATE_PATTERNS = [
     r"Prochain(?:\s+RDV| rendez-vous)?\s*(?:le)?\s*([0-9]{1,2}\s+\w+\s+[0-9]{4})",
     r"Prochain(?:\s+RDV| rendez-vous)?\s*(?:le)?\s*([0-9]{1,2}\s+\w+)",
     r"Disponibilit[ée]s?\s*(?:le)?\s*([0-9]{1,2}\s+\w+(?:\s+[0-9]{4})?)",
 ]
-
 MONTHS_FR = {
     "janvier":"January","février":"February","fevrier":"February","mars":"March","avril":"April",
     "mai":"May","juin":"June","juillet":"July","août":"August","aout":"August",
     "septembre":"September","octobre":"October","novembre":"November","décembre":"December","decembre":"December"
 }
+# ---------------------------
 
 def fr_to_en_date(s: str) -> str:
     t = s.lower()
-    for fr,en in MONTHS_FR.items(): t = re.sub(rf"\b{fr}\b", en, t)
+    for fr,en in MONTHS_FR.items():
+        t = re.sub(rf"\b{fr}\b", en, t)
     return t
 
 def parse_date_fr(text: str):
     for pat in DATE_PATTERNS:
         m = re.search(pat, text, flags=re.IGNORECASE)
-        if not m: 
+        if not m:
             continue
         raw = m.group(1).strip()
         try:
@@ -51,7 +53,7 @@ def parse_date_fr(text: str):
         return TZ.localize(datetime.now() + timedelta(days=1))
     return None
 
-async def fetch_derm_in_14_days():
+async def fetch_derm(window_days: int):
     out = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -63,7 +65,7 @@ async def fetch_derm_in_14_days():
             await page.get_by_role("button", name=re.compile("Accepter|Tout accepter|J'accepte", re.I)).click(timeout=3000)
         except Exception:
             pass
-        # scroll
+        # scroll (lazy load)
         last_h = 0
         for _ in range(8):
             await page.mouse.wheel(0, 2000)
@@ -79,17 +81,17 @@ async def fetch_derm_in_14_days():
             try:
                 name = (await a.inner_text()).strip()
                 href = await a.get_attribute("href") or ""
-                if not name or not href: 
+                if not name or not href:
                     continue
                 card = a.locator("xpath=ancestor::article | xpath=ancestor::div[contains(@class,'card')]")
                 card_text = (await card.inner_text()).replace("\n", " ")
                 dt = parse_date_fr(card_text)
-                if not dt: 
+                if not dt:
                     continue
-                if now <= dt <= now + timedelta(days=WINDOW_DAYS):
+                if now <= dt <= now + timedelta(days=window_days):
                     url = "https://www.doctolib.fr" + href if href.startswith("/") else href
                     key = (name, url)
-                    if key in seen: 
+                    if key in seen:
                         continue
                     seen.add(key)
                     out.append({"name": name, "date": dt, "url": url})
@@ -99,77 +101,45 @@ async def fetch_derm_in_14_days():
     out.sort(key=lambda x: x["date"])
     return out
 
-def load_state():
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"items": []}
-
-def save_state(items):
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump({"items": items}, f, ensure_ascii=False, indent=2)
-
-def canonicalize(items):
-    # On ne garde que (name, url, date_jour) pour la comparaison
-    canon = []
+def fmt(items):
+    if not items:
+        return "Aucune disponibilité ≤ fenêtre définie."
+    lines = ["🧴 Dermatologues avec RDV ≤ fenêtre définie (Toulouse):"]
     for it in items:
         d = it["date"].astimezone(TZ)
-        canon.append({
-            "name": it["name"],
-            "url": it["url"],
-            "day": d.strftime("%Y-%m-%d")  # ignore l’heure si Doctolib ne la donne pas toujours
-        })
-    return sorted(canon, key=lambda x: (x["day"], x["name"], x["url"]))
-
-def compute_diff(old, new):
-    old_set = {(i["name"], i["url"], i["day"]) for i in old}
-    new_set = {(i["name"], i["url"], i["day"]) for i in new}
-    added = new_set - old_set
-    removed = old_set - new_set
-    return added, removed
-
-def send_telegram(text):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        print("TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant — aucun envoi Telegram.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        r.raise_for_status()
-    except Exception as e:
-        print("Erreur envoi Telegram:", e)
-
-def fmt(items):
-    lines = ["🧴 Dermatologues avec RDV ≤ 14 jours (Toulouse):"]
-    for it in items:
-        lines.append(
-            f"• {it['name']} — {it['date'].strftime('%a %d/%m').capitalize()} "
-            f"{'' if it['date'].strftime('%H%M')=='0000' else 'à ' + it['date'].strftime('%Hh')}\n  {it['url']}"
-        )
+        hh = "" if d.strftime("%H%M") == "0000" else f" à {d.strftime('%Hh')}"
+        lines.append(f"• {it['name']} — {d.strftime('%a %d/%m').capitalize()}{hh}\n  {it['url']}")
     return "\n".join(lines)
 
-async def main():
-    items = await fetch_derm_in_14_days()
-    # log console
-    for it in items:
-        print(f"{it['date'].strftime('%Y-%m-%d')}  {it['name']}  {it['url']}")
-    # diff vs état précédent
-    state = load_state()
-    old = state.get("items", [])
-    new = canonicalize(items)
-    added, removed = compute_diff(old, new)
+def send_telegram(text: str):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("[INFO] Pas de TELEGRAM_BOT_TOKEN/CHAT_ID -> impression console uniquement.")
+        print(text)
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=20)
+        r.raise_for_status()
+        print("[OK] Message Telegram envoyé.")
+    except Exception as e:
+        print("[ERR] Envoi Telegram:", e)
 
-    if not old and not new and os.getenv("NOTIFY_WHEN_EMPTY", "0") == "1":
-        send_telegram("Aucune dispo détectée pour les 14 prochains jours.")
-    elif added or removed:
-        # Il y a du nouveau (ajouts ou suppressions) → on envoie la liste complète courante
-        send_telegram(fmt(items) if items else "Plus de disponibilité ≤ 14 jours pour le moment.")
-        save_state(new)
+async def main():
+    parser = argparse.ArgumentParser(description="Doctobot – Dispos derma Toulouse")
+    parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_DAYS, help="Fenêtre en jours (def. 14)")
+    parser.add_argument("--print-only", action="store_true", help="N'envoie pas sur Telegram, affiche seulement")
+    args = parser.parse_args()
+
+    items = await fetch_derm(args.window)
+    for it in items:
+        print(f"{it['date'].strftime('%Y-%m-%d %H:%M')}  {it['name']}  {it['url']}")
+    msg = fmt(items)
+
+    if args.print-only:
+        print("\n--- MESSAGE ---\n" + msg)
     else:
-        print("Aucun changement — pas d'envoi Telegram.")
+        send_telegram(msg)
 
 if __name__ == "__main__":
     asyncio.run(main())
