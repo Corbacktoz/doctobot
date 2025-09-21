@@ -128,7 +128,8 @@ def send_telegram(text: str):
 async def main():
     parser = argparse.ArgumentParser(description="Doctobot – Dispos derma Toulouse")
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_DAYS, help="Fenêtre en jours (def. 14)")
-    parser.add_argument("--print-only", action="store_true", help="N'envoie pas sur Telegram, affiche seulement")
+    parser.add_argument("--print-only", dest="print_only", action="store_true",
+                        help="N'envoie pas sur Telegram, affiche seulement")
     args = parser.parse_args()
 
     items = await fetch_derm(args.window)
@@ -136,7 +137,7 @@ async def main():
         print(f"{it['date'].strftime('%Y-%m-%d %H:%M')}  {it['name']}  {it['url']}")
     msg = fmt(items)
 
-    if args.print-only:
+    if args.print_only:
         print("\n--- MESSAGE ---\n" + msg)
     else:
         send_telegram(msg)
