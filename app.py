@@ -6,7 +6,7 @@ from dateutil import parser as dp
 from playwright.async_api import async_playwright
 
 # --------- Config ----------
-DOCTOLIB_URL = "https://www.doctolib.fr/dermatologue/toulouse?availabilities=1"
+DOCTOLIB_URL = "https://www.doctolib.fr/pneumologue-pediatrique/toulouse?availabilities=1"
 TZ = pytz.timezone("Europe/Paris")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -104,7 +104,7 @@ async def fetch_derm(window_days: int):
 def fmt(items):
     if not items:
         return "Aucune disponibilité ≤ fenêtre définie."
-    lines = ["🧴 Dermatologues avec RDV ≤ fenêtre définie (Toulouse):"]
+    lines = ["👶 Pneumologues pédiatriques avec RDV ≤ fenêtre définie (Toulouse):"]
     for it in items:
         d = it["date"].astimezone(TZ)
         hh = "" if d.strftime("%H%M") == "0000" else f" à {d.strftime('%Hh')}"
