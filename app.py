@@ -7,108 +7,121 @@ from playwright.async_api import async_playwright
 
 # --------- Config ----------
 DOCTOLIB_URL = "https://www.doctolib.fr/pneumologue-pediatrique/toulouse?availabilities=1"
+MAIIA_URL = "https://www.maiia.com/recherche/pneumologue-pediatrique/toulouse"
 TZ = pytz.timezone("Europe/Paris")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# Env var pour la fenêtre par défaut (jours)
 DEFAULT_WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "14"))
 
-DATE_PATTERNS = [
-    r"Prochain(?:\s+RDV| rendez-vous)?\s*(?:le)?\s*([0-9]{1,2}\s+\w+\s+[0-9]{4})",
-    r"Prochain(?:\s+RDV| rendez-vous)?\s*(?:le)?\s*([0-9]{1,2}\s+\w+)",
-    r"Disponibilit[ée]s?\s*(?:le)?\s*([0-9]{1,2}\s+\w+(?:\s+[0-9]{4})?)",
-]
-MONTHS_FR = {
-    "janvier":"January","février":"February","fevrier":"February","mars":"March","avril":"April",
-    "mai":"May","juin":"June","juillet":"July","août":"August","aout":"August",
-    "septembre":"September","octobre":"October","novembre":"November","décembre":"December","decembre":"December"
-}
 # ---------------------------
 
 def fr_to_en_date(s: str) -> str:
+    months = {
+        "janvier": "January", "février": "February", "fevrier": "February", "mars": "March", "avril": "April",
+        "mai": "May", "juin": "June", "juillet": "July", "août": "August", "aout": "August",
+        "septembre": "September", "octobre": "October", "novembre": "November", "décembre": "December"
+    }
     t = s.lower()
-    for fr,en in MONTHS_FR.items():
+    for fr, en in months.items():
         t = re.sub(rf"\b{fr}\b", en, t)
     return t
 
 def parse_date_fr(text: str):
-    for pat in DATE_PATTERNS:
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if not m:
-            continue
-        raw = m.group(1).strip()
-        try:
-            en = fr_to_en_date(raw)
-            dt = dp.parse(en, dayfirst=True, default=TZ.localize(datetime.now()).replace(month=1, day=1))
-            if dt.tzinfo is None:
-                dt = TZ.localize(dt)
-            return dt
-        except Exception:
-            continue
-    # cas "aujourd'hui"/"demain"
-    if re.search(r"\baujourd'hui\b", text, re.I):
-        return TZ.localize(datetime.now())
-    if re.search(r"\bdemain\b", text, re.I):
-        return TZ.localize(datetime.now() + timedelta(days=1))
+    for pat in [
+        r"([0-9]{1,2}\s+\w+\s+[0-9]{4})",
+        r"([0-9]{1,2}\s+\w+)",
+        r"aujourd'hui", r"demain"
+    ]:
+        if "aujourd" in pat and "aujourd" in text.lower():
+            return TZ.localize(datetime.now())
+        if "demain" in pat and "demain" in text.lower():
+            return TZ.localize(datetime.now() + timedelta(days=1))
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            raw = m.group(1)
+            try:
+                en = fr_to_en_date(raw)
+                dt = dp.parse(en, dayfirst=True)
+                if dt.tzinfo is None:
+                    dt = TZ.localize(dt)
+                return dt
+            except Exception:
+                pass
     return None
 
-async def fetch_derm(window_days: int):
+# ---------- Doctolib ----------
+async def fetch_doctolib(window_days: int):
     out = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(locale="fr-FR", timezone_id="Europe/Paris")
         page = await context.new_page()
         await page.goto(DOCTOLIB_URL, wait_until="domcontentloaded")
-        # cookies
         try:
             await page.get_by_role("button", name=re.compile("Accepter|Tout accepter|J'accepte", re.I)).click(timeout=3000)
         except Exception:
             pass
-        # scroll (lazy load)
-        last_h = 0
-        for _ in range(8):
-            await page.mouse.wheel(0, 2000)
-            await page.wait_for_timeout(600)
-            h = await page.evaluate("() => document.body.scrollHeight")
-            if h == last_h: break
-            last_h = h
-        # cartes
-        cards = await page.locator("a[href*='/dermatologue/']").all()
-        seen = set()
+        await page.wait_for_timeout(1500)
+        cards = await page.locator("a[href*='/pneumologue']").all()
         now = TZ.localize(datetime.now())
+        seen = set()
         for a in cards:
             try:
                 name = (await a.inner_text()).strip()
                 href = await a.get_attribute("href") or ""
-                if not name or not href:
-                    continue
                 card = a.locator("xpath=ancestor::article | xpath=ancestor::div[contains(@class,'card')]")
-                card_text = (await card.inner_text()).replace("\n", " ")
-                dt = parse_date_fr(card_text)
-                if not dt:
-                    continue
-                if now <= dt <= now + timedelta(days=window_days):
+                text = (await card.inner_text()).replace("\n", " ")
+                dt = parse_date_fr(text)
+                if dt and now <= dt <= now + timedelta(days=window_days):
                     url = "https://www.doctolib.fr" + href if href.startswith("/") else href
-                    key = (name, url)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    out.append({"name": name, "date": dt, "url": url})
+                    if (name, url) not in seen:
+                        seen.add((name, url))
+                        out.append({"source": "Doctolib", "name": name, "date": dt, "url": url})
             except Exception:
                 continue
         await browser.close()
-    out.sort(key=lambda x: x["date"])
     return out
 
+# ---------- Maiia ----------
+async def fetch_maiia(window_days: int):
+    out = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(locale="fr-FR", timezone_id="Europe/Paris")
+        page = await context.new_page()
+        await page.goto(MAIIA_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        cards = await page.locator("a[href*='/cabinet/'], a[href*='/docteur/']").all()
+        now = TZ.localize(datetime.now())
+        seen = set()
+        for a in cards:
+            try:
+                name = (await a.inner_text()).strip()
+                href = await a.get_attribute("href") or ""
+                card = a.locator("xpath=ancestor::article | xpath=ancestor::div")
+                text = (await card.inner_text()).replace("\n", " ")
+                dt = parse_date_fr(text)
+                if dt and now <= dt <= now + timedelta(days=window_days):
+                    url = "https://www.maiia.com" + href if href.startswith("/") else href
+                    if (name, url) not in seen:
+                        seen.add((name, url))
+                        out.append({"source": "Maiia", "name": name, "date": dt, "url": url})
+            except Exception:
+                continue
+        await browser.close()
+    return out
+
+# ---------- Format + Telegram ----------
 def fmt(items):
     if not items:
-        return "Aucune disponibilité ≤ fenêtre définie."
-    lines = ["👶 Pneumologues pédiatriques avec RDV ≤ fenêtre définie (Toulouse):"]
+        return "Aucune disponibilité trouvée sur Doctolib ou Maiia."
+    items.sort(key=lambda x: x["date"])
+    lines = ["👶 Pneumologues pédiatriques disponibles (Toulouse):"]
     for it in items:
         d = it["date"].astimezone(TZ)
         hh = "" if d.strftime("%H%M") == "0000" else f" à {d.strftime('%Hh')}"
-        lines.append(f"• {it['name']} — {d.strftime('%a %d/%m').capitalize()}{hh}\n  {it['url']}")
+        lines.append(f"• [{it['source']}] {it['name']} — {d.strftime('%a %d/%m').capitalize()}{hh}\n  {it['url']}")
     return "\n".join(lines)
 
 def send_telegram(text: str):
@@ -125,17 +138,19 @@ def send_telegram(text: str):
     except Exception as e:
         print("[ERR] Envoi Telegram:", e)
 
+# ---------- Main ----------
 async def main():
-    parser = argparse.ArgumentParser(description="Doctobot – Dispos derma Toulouse")
-    parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_DAYS, help="Fenêtre en jours (def. 14)")
-    parser.add_argument("--print-only", dest="print_only", action="store_true",
-                        help="N'envoie pas sur Telegram, affiche seulement")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--window", type=int, default=DEFAULT_WINDOW_DAYS)
+    parser.add_argument("--print-only", dest="print_only", action="store_true")
     args = parser.parse_args()
 
-    items = await fetch_derm(args.window)
-    for it in items:
-        print(f"{it['date'].strftime('%Y-%m-%d %H:%M')}  {it['name']}  {it['url']}")
-    msg = fmt(items)
+    print("[INFO] Recherche Doctolib + Maiia…")
+    results_doctolib = await fetch_doctolib(args.window)
+    results_maiia = await fetch_maiia(args.window)
+    all_items = results_doctolib + results_maiia
+
+    msg = fmt(all_items)
 
     if args.print_only:
         print("\n--- MESSAGE ---\n" + msg)
